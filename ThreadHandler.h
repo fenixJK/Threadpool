@@ -9,10 +9,11 @@
 #include <stdexcept>
 #include <algorithm>
 #include <memory>
+#include <map>
 
 class ThreadPool {
 public:
-    ThreadPool(size_t threads) : stop(false), autoCreateThreads(false), timeLimit(std::chrono::milliseconds(100)) {
+    ThreadPool(size_t threads) : stop(false), autoCreateThreads(false) {
         newThreads(threads);
     }
 
@@ -21,34 +22,55 @@ public:
         using return_type = typename std::invoke_result<F, Args...>::type;
         auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
         std::future<return_type> res = task->get_future();
+        size_t Task_Amount = 0;
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             if (stop) throw std::runtime_error("enqueue on stopped ThreadPool");
             tasks.emplace([task]() { (*task)(); });
+            Task_Amount = tasks.size();
         }
         condition.notify_one();
+        if (autoCreateThreads && MAX_AUTO_THREAD_LIMIT > 0) {
+            std::thread([this, Task_Amount] {
+                size_t Amount = 0;
+                {
+                    std::lock_guard<std::mutex> state_lock(this->Waiting_Mutex);
+                    Amount = this->Waiting_Amount;
+                }
+                if (!(this->Waiting_Amount > Task_Amount)) {
+                    size_t amount = Task_Amount - this->Waiting_Amount;
+                    std::clamp(amount, size_t(0), this->MAX_AUTO_THREAD_LIMIT - this->AUTO_THREAD_AMOUNT);
+                    this->newThreads(amount);
+                    this->AUTO_THREAD_AMOUNT += amount;
+                }
+            });
+        }
         return res;
     }
 
-    void setAutoCreateThreads(bool enable, std::chrono::milliseconds limit = std::chrono::milliseconds(100), size_t Max_Threads = 0) {
+    void setAutoCreateThreads(bool enable, size_t Max_Threads = 0) {
         autoCreateThreads = enable;
-        timeLimit = limit;
-        MAX_THREAD_LIMIT = Max_Threads;
+        MAX_AUTO_THREAD_LIMIT = Max_Threads;
+    }
+
+    size_t getActiveThreadCount() {
+        std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
+        return workers.size() - Waiting_Amount;
     }
 
     void removeThreads(size_t threads) {
+        if (workers.size() < threads) throw std::runtime_error("attempted to stop more then the amount of threads");
         size_t threadsStopped = 0;
-        auto it = workers.begin();
-        while (it != workers.end() && threadsStopped < threads) {
-            std::lock_guard<std::mutex> state_lock((*it)->state_mutex);
-            if ((*it)->state == ThreadState::Waiting) {
-                (*it)->state = ThreadState::Stopped;
+        while (threadsStopped < threads) {
+            auto it = workers.begin();
+            while (it != workers.end() && threadsStopped < threads) {
+                {
+                    std::lock_guard<std::mutex> state_lock(it->second->state_mutex);
+                    it->second->state = ThreadState::Stopped;
+                }
                 condition.notify_all();
                 it = workers.erase(it);
                 ++threadsStopped;
-            }
-            else {
-                ++it;
             }
         }
     }
@@ -59,9 +81,6 @@ public:
             stop = true;
         }
         condition.notify_all();
-        for (auto& worker : workers) {
-            if (worker->thread.joinable()) worker->thread.join();
-        }
     }
 
 private:
@@ -81,45 +100,83 @@ private:
     };
 
     void newThreads(size_t threads) {
-        for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back(std::make_unique<Worker>(std::thread([this, i] {
+        for (size_t i = 0; i < threads; ++i, this->threadID++) {
+            workers.emplace(this->threadID, std::make_unique<Worker>(std::thread([this] {
+                Worker* worker = this->workers[this->threadID].get();
+                {
+                    std::lock_guard<std::mutex> state_lock(worker->state_mutex);
+                    worker->state = ThreadState::Waiting;
+                    std::lock_guard<std::mutex> state_lock2(Waiting_Mutex);
+                    ++Waiting_Amount;
+                }
                 for (;;) {
                     std::function<void()> task;
                     {
                         std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        if (this->condition.wait_for(lock, this->timeLimit, [this] { return this->stop || !this->tasks.empty(); })) {
-                            if (this->stop && this->tasks.empty()) return; // Safely exit if stopping and no tasks
-                            if (!this->tasks.empty()) {  // Check for empty queue
-                                task = std::move(this->tasks.front());
-                                this->tasks.pop();
+                        this->condition.wait(lock, [this, worker] {
+                            std::lock_guard<std::mutex> state_guard(worker->state_mutex);
+                            return this->stop || worker->state == ThreadState::Stopped || !this->tasks.empty(); 
+                        });
+                        std::lock_guard<std::mutex> state_guard(worker->state_mutex);
+                        if ((this->stop) || worker->state == ThreadState::Stopped) {
+                            {
+                                std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
+                                --Waiting_Amount;
                             }
+                            return;
                         }
-                        if (this->autoCreateThreads && (workers.size() < MAX_THREAD_LIMIT || !MAX_THREAD_LIMIT)) {
-                            this->newThreads(1);
+                        else {
+                            task = std::move(this->tasks.front());
+                            this->tasks.pop();
                         }
                     }
-                    if (task) {  // Ensure task is valid before calling
+                    if (task) {
                         {
-                            std::lock_guard<std::mutex> state_lock(this->workers[i]->state_mutex);
-                            this->workers[i]->state = ThreadState::Running;
+                            std::lock_guard<std::mutex> state_lock(worker->state_mutex);
+                            if (worker->state != ThreadState::Stopped) {
+                                worker->state = ThreadState::Running;
+                            }
                         }
-                        task(); // Safely execute the task
+                        task();
                         {
-                            std::lock_guard<std::mutex> state_lock(this->workers[i]->state_mutex);
-                            this->workers[i]->state = ThreadState::Waiting;
+                            std::lock_guard<std::mutex> state_lock(worker->state_mutex);
+                            if (worker->state != ThreadState::Stopped) {
+                                worker->state = ThreadState::Waiting;
+                                {
+                                    std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
+                                    ++Waiting_Amount;
+                                }
+                            }
                         }
                     }
                 }
-                })));
+            })));
         }
     }
 
-    std::vector<std::unique_ptr<Worker>> workers;
+    #if defined(_WIN32) || defined(_WIN64)
+    #include <windows.h>
+    void forceTerminateThread(std::thread& th) {
+        TerminateThread(th.native_handle(), 0);
+        th.detach();
+    }
+    #elif defined(__linux__) || defined(__APPLE__)
+    #include <pthread.h>
+    void forceTerminateThread(std::thread& th) {
+        pthread_cancel(th.native_handle());
+        th.detach();
+    }
+    #endif
+
+    std::map<size_t, std::unique_ptr<Worker>> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
     std::condition_variable condition;
     bool stop;
     bool autoCreateThreads;
-    std::chrono::milliseconds timeLimit;
-    size_t MAX_THREAD_LIMIT = 0;
+    size_t MAX_AUTO_THREAD_LIMIT = 0;
+    size_t AUTO_THREAD_AMOUNT = 0;
+    size_t threadID = 0;
+    std::mutex Waiting_Mutex;
+    size_t Waiting_Amount = 0;
 };
