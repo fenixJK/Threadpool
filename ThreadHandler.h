@@ -20,30 +20,30 @@ public:
     template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args) -> std::future<typename std::invoke_result<F, Args...>::type> {
         using return_type = typename std::invoke_result<F, Args...>::type;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
         std::future<return_type> res = task->get_future();
-        size_t Task_Amount = 0;
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             if (stop) throw std::runtime_error("enqueue on stopped ThreadPool");
             tasks.emplace([task]() { (*task)(); });
-            Task_Amount = tasks.size();
         }
         condition.notify_one();
         if (autoCreateThreads && MAX_AUTO_THREAD_LIMIT > 0) {
-            std::thread([this, Task_Amount] {
-                size_t Amount = 0;
+            std::thread([this] {
+                size_t Task_Amount = tasks.size();
+                size_t Amount;
                 {
-                    std::lock_guard<std::mutex> state_lock(this->Waiting_Mutex);
-                    Amount = this->Waiting_Amount;
+                    std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
+                    Amount = Waiting_Amount;
                 }
-                if (!(this->Waiting_Amount > Task_Amount)) {
-                    size_t amount = Task_Amount - this->Waiting_Amount;
-                    std::clamp(amount, size_t(0), this->MAX_AUTO_THREAD_LIMIT - this->AUTO_THREAD_AMOUNT);
-                    this->newThreads(amount);
-                    this->AUTO_THREAD_AMOUNT += amount;
+                if (Amount < Task_Amount) {
+                    size_t amount = std::clamp(Task_Amount - Amount, size_t(0), MAX_AUTO_THREAD_LIMIT - AUTO_THREAD_AMOUNT);
+                    newThreads(amount);
+                    AUTO_THREAD_AMOUNT += amount;
                 }
-            });
+                }).detach();
         }
         return res;
     }
@@ -93,6 +93,7 @@ private:
     class Worker {
     public:
         Worker(std::thread&& thread) : thread(std::move(thread)), state(ThreadState::Waiting) {}
+        Worker() : state(ThreadState::Stopped) {}
         ~Worker() { if (thread.joinable()) thread.join(); }
         std::thread thread;
         ThreadState state;
@@ -100,9 +101,10 @@ private:
     };
 
     void newThreads(size_t threads) {
-        for (size_t i = 0; i < threads; ++i, this->threadID++) {
-            workers.emplace(this->threadID, std::make_unique<Worker>(std::thread([this] {
-                Worker* worker = this->workers[this->threadID].get();
+        for (size_t i = 0; i < threads; ++i, threadID++) {
+            workers.emplace(threadID, std::make_unique<Worker>());
+            Worker* worker = workers[this->threadID].get();
+            worker->thread = std::thread([this, worker] {
                 {
                     std::lock_guard<std::mutex> state_lock(worker->state_mutex);
                     worker->state = ThreadState::Waiting;
@@ -150,7 +152,7 @@ private:
                         }
                     }
                 }
-            })));
+            });
         }
     }
 
