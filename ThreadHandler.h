@@ -13,7 +13,7 @@
 
 class ThreadPool {
 public:
-    ThreadPool(size_t threads) : stop(false), autoCreateThreads(false) {
+    ThreadPool(size_t threads, bool WaitForTasks = true) : stop(false), waitForTasks(WaitForTasks) {
         newThreads(threads);
     }
 
@@ -30,32 +30,7 @@ public:
             tasks.emplace([task]() { (*task)(); });
         }
         condition.notify_one();
-        if (autoCreateThreads && MAX_AUTO_THREAD_LIMIT > 0) {
-            std::thread([this] {
-                size_t Task_Amount = tasks.size();
-                size_t Amount;
-                {
-                    std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
-                    Amount = Waiting_Amount;
-                }
-                if (Amount < Task_Amount) {
-                    size_t amount = std::clamp(Task_Amount - Amount, size_t(0), MAX_AUTO_THREAD_LIMIT - AUTO_THREAD_AMOUNT);
-                    newThreads(amount);
-                    AUTO_THREAD_AMOUNT += amount;
-                }
-                }).detach();
-        }
         return res;
-    }
-
-    void setAutoCreateThreads(bool enable, size_t Max_Threads = 0) {
-        autoCreateThreads = enable;
-        MAX_AUTO_THREAD_LIMIT = Max_Threads;
-    }
-
-    size_t getActiveThreadCount() {
-        std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
-        return workers.size() - Waiting_Amount;
     }
 
     void removeThreads(size_t threads) {
@@ -74,6 +49,17 @@ public:
             }
         }
     }
+
+    void addThreads(size_t threads) {
+        newThreads(threads);
+    }
+
+    void setWaitForTasks(bool WaitForTasks) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        this->waitForTasks = WaitForTasks;
+    }
+
+    size_t gethreadCount() { return workers.size(); }
 
     ~ThreadPool() {
         {
@@ -108,7 +94,6 @@ private:
                 {
                     std::lock_guard<std::mutex> state_lock(worker->state_mutex);
                     worker->state = ThreadState::Waiting;
-                    std::lock_guard<std::mutex> state_lock2(Waiting_Mutex);
                     ++Waiting_Amount;
                 }
                 for (;;) {
@@ -120,11 +105,8 @@ private:
                             return this->stop || worker->state == ThreadState::Stopped || !this->tasks.empty(); 
                         });
                         std::lock_guard<std::mutex> state_guard(worker->state_mutex);
-                        if ((this->stop) || worker->state == ThreadState::Stopped) {
-                            {
-                                std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
-                                --Waiting_Amount;
-                            }
+                        if ((this->stop && (this->tasks.empty() || !waitForTasks)) || worker->state == ThreadState::Stopped) {
+                            --Waiting_Amount;
                             return;
                         }
                         else {
@@ -138,17 +120,15 @@ private:
                             if (worker->state != ThreadState::Stopped) {
                                 worker->state = ThreadState::Running;
                             }
+                            --Waiting_Amount;
                         }
                         task();
                         {
                             std::lock_guard<std::mutex> state_lock(worker->state_mutex);
                             if (worker->state != ThreadState::Stopped) {
                                 worker->state = ThreadState::Waiting;
-                                {
-                                    std::lock_guard<std::mutex> state_lock(Waiting_Mutex);
-                                    ++Waiting_Amount;
-                                }
                             }
+                            ++Waiting_Amount;
                         }
                     }
                 }
@@ -159,26 +139,24 @@ private:
     #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
     void forceTerminateThread(std::thread& th) {
-        TerminateThread(th.native_handle(), 0);
+        HANDLE hThread = th.native_handle();
+        TerminateThread(hThread, 0);
         th.detach();
     }
     #elif defined(__linux__) || defined(__APPLE__)
     #include <pthread.h>
     void forceTerminateThread(std::thread& th) {
-        pthread_cancel(th.native_handle());
+        pthread_kill(th.native_handle(), SIGKILL);
         th.detach();
     }
-    #endif
+#endif
 
     std::map<size_t, std::unique_ptr<Worker>> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
     std::condition_variable condition;
     bool stop;
-    bool autoCreateThreads;
-    size_t MAX_AUTO_THREAD_LIMIT = 0;
-    size_t AUTO_THREAD_AMOUNT = 0;
     size_t threadID = 0;
-    std::mutex Waiting_Mutex;
     size_t Waiting_Amount = 0;
+    bool waitForTasks;
 };
