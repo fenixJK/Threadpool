@@ -13,7 +13,7 @@
 
 class ThreadPool {
 public:
-    ThreadPool(size_t threads, bool WaitForTasks = true) : stop(false), waitForTasks(WaitForTasks) {
+    ThreadPool(size_t threads) : stop(false), autoCreateThreads(false) {
         newThreads(threads);
     }
 
@@ -24,6 +24,17 @@ public:
             std::bind(std::forward<F>(f), std::forward<Args>(args)...)
         );
         std::future<return_type> res = task->get_future();
+        size_t Amount = 0;
+        {
+            std::lock_guard<std::mutex> state_lock(this->Waiting_Mutex);
+            Amount = this->Waiting_Amount;
+        }
+        if (autoCreateThreads && Amount <= 0) {
+            std::thread([this] {
+                (*task)();
+            });
+            return res;
+        }
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             if (stop) throw std::runtime_error("enqueue on stopped ThreadPool");
@@ -31,6 +42,10 @@ public:
         }
         condition.notify_one();
         return res;
+    }
+
+    void setAutoCreateThreads(bool enable) {
+        autoCreateThreads = enable;
     }
 
     void removeThreads(size_t threads) {
@@ -52,11 +67,6 @@ public:
 
     void addThreads(size_t threads) {
         newThreads(threads);
-    }
-
-    void setWaitForTasks(bool WaitForTasks) {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        this->waitForTasks = WaitForTasks;
     }
 
     size_t gethreadCount() { return workers.size(); }
@@ -94,6 +104,9 @@ private:
                 {
                     std::lock_guard<std::mutex> state_lock(worker->state_mutex);
                     worker->state = ThreadState::Waiting;
+                }
+                {
+                    std::lock_guard<std::mutex> waiting_lock(waiting_mutex);
                     ++Waiting_Amount;
                 }
                 for (;;) {
@@ -105,8 +118,7 @@ private:
                             return this->stop || worker->state == ThreadState::Stopped || !this->tasks.empty(); 
                         });
                         std::lock_guard<std::mutex> state_guard(worker->state_mutex);
-                        if ((this->stop && (this->tasks.empty() || !waitForTasks)) || worker->state == ThreadState::Stopped) {
-                            --Waiting_Amount;
+                        if ((this->stop && this->tasks.empty()) || worker->state == ThreadState::Stopped) {
                             return;
                         }
                         else {
@@ -120,15 +132,20 @@ private:
                             if (worker->state != ThreadState::Stopped) {
                                 worker->state = ThreadState::Running;
                             }
+                        }
+                        {
+                            std::lock_guard<std::mutex> waiting_lock(waiting_mutex);
                             --Waiting_Amount;
                         }
                         task();
                         {
-                            std::lock_guard<std::mutex> state_lock(worker->state_mutex);
+                            std::unique_lock<std::mutex> state_lock(worker->state_mutex);
                             if (worker->state != ThreadState::Stopped) {
                                 worker->state = ThreadState::Waiting;
+                                state_lock.unlock();
+                                std::lock_guard<std::mutex> waiting_lock(waiting_mutex);
+                                ++Waiting_Amount;
                             }
-                            ++Waiting_Amount;
                         }
                     }
                 }
@@ -154,9 +171,10 @@ private:
     std::map<size_t, std::unique_ptr<Worker>> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
+    std::mutex waiting_mutex;
     std::condition_variable condition;
     bool stop;
     size_t threadID = 0;
     size_t Waiting_Amount = 0;
-    bool waitForTasks;
+    bool autoCreateThreads;
 };
