@@ -30,7 +30,7 @@ public:
             Amount = this->Waiting_Amount;
         }
         if (autoCreateThreads && Amount <= 0) {
-            std::thread([this] {
+            std::thread([this, task] {
                 (*task)();
             });
             return res;
