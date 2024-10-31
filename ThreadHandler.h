@@ -26,7 +26,7 @@ public:
         std::future<return_type> res = task->get_future();
         size_t Amount = 0;
         {
-            std::lock_guard<std::mutex> state_lock(this->Waiting_Mutex);
+            std::lock_guard<std::mutex> state_lock(this->waiting_mutex);
             Amount = this->Waiting_Amount;
         }
         if (autoCreateThreads && Amount <= 0) {
@@ -152,22 +152,6 @@ private:
             });
         }
     }
-
-    #if defined(_WIN32) || defined(_WIN64)
-    #include <windows.h>
-    void forceTerminateThread(std::thread& th) {
-        HANDLE hThread = th.native_handle();
-        TerminateThread(hThread, 0);
-        th.detach();
-    }
-    #elif defined(__linux__) || defined(__APPLE__)
-    #include <pthread.h>
-    void forceTerminateThread(std::thread& th) {
-        pthread_kill(th.native_handle(), SIGKILL);
-        th.detach();
-    }
-#endif
-
     std::map<size_t, std::unique_ptr<Worker>> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
